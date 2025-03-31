@@ -1,0 +1,10 @@
+---
+title: "ess330_Lab_6"
+author: "Chloe Rogozinski"
+date: "2025-03-31"
+format: html
+execute:
+  echo: true
+---
+
+## Quarto
