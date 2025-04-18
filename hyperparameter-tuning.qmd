@@ -273,6 +273,15 @@ collect_metrics(final_fit)
 ```
 
 #answer: The final model performed really well on the test set, with low RMSE and high R². This means the predictions were close to the actual values and the model explained nearly all the variance in q_mean. The performance is consistent with training, so the model generalized well.
+```{r}
+final_preds <- collect_predictions(final_fit)
+
+final_fit <- last_fit(
+  final_rf_workflow,
+  split = data_split
+)
+
+```
 
 ```{r}
 #ggplot
@@ -288,7 +297,6 @@ ggplot(final_preds, aes(x = .pred, y = q_mean)) +
     color = "Prediction"
   ) +
   theme_minimal()
-
 ```
 
 ## Building a Map
