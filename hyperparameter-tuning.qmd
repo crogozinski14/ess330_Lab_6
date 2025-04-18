@@ -1,0 +1,340 @@
+---
+title: "hyperparameter-tuning"
+author: "Chloe Rogozinski"
+date: "2025-04-17"
+format: html
+execute:
+  echo: true
+---
+
+##Lab 8
+
+## Data Import/Tidy/Transform
+
+```{r}
+#load required packages
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(readr)
+library(skimr)
+library(visdat)
+library(ggpubr)
+```
+
+## Read in data
+```{r}
+library(tidyverse)
+library(powerjoin)
+
+# List all attribute files
+attribute_files <- list.files("data", pattern = "camels_.*\\.txt$", full.names = TRUE)
+
+# Define a function to read each file with the correct delimiter
+read_camels_file <- function(file) {
+  read_delim(
+    file,
+    delim = ";",
+    col_types = cols(.default = col_double(), gauge_id = col_character()),
+    trim_ws = TRUE
+  )
+}
+
+# Read each file and join by `gauge_id`
+camels_list <- attribute_files %>%
+  set_names(basename(.)) %>%
+  map(read_camels_file)
+
+# Merge all datasets
+camels <- reduce(camels_list, power_full_join, by = "gauge_id")
+
+# Preview structure
+glimpse(camels)
+
+```
+
+
+```{r}
+#remove columns with missing values
+camels_clean <- camels %>%
+  select(where(~ mean(!is.na(.)) > 0.5))  
+
+#drop rows missing values
+camels_clean <- camels_clean %>%
+  drop_na(runoff_ratio)
+
+camels_for_map <- camels_clean  
+
+camels_model <- camels_for_map %>%
+  select(-gauge_id, -gauge_lat, -gauge_lon)
+
+
+
+#check columns
+camels_clean %>%
+  select(where(is.character)) %>%
+  names()
+
+```
+
+## Data Splitting
+
+```{r}
+#set seed, split data, and extract sets
+set.seed(123)
+
+data_split <- initial_split(camels_model, prop = 0.8)
+
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+```
+
+
+## Feature Engineering
+```{r}
+#create recipe
+qmean_recipe <- recipe(q_mean ~ ., data = train_data) %>%
+  step_normalize(all_predictors()) %>%
+  step_corr(all_predictors(), threshold = 0.9) %>%
+  step_nzv(all_predictors())
+                
+```
+
+# 1. Build resamples
+
+```{r}
+#set seed and resample data
+set.seed(123)  
+cv_folds <- vfold_cv(train_data, v = 10)
+
+```
+
+# 2. Build 3 Canidate Models
+
+```{r}
+#linear regression model
+linear_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+```
+
+
+```{r}
+#Random forest model
+rf_model <- rand_forest(trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+```
+
+
+```{r}
+#Boosted tree model
+xgb_model <- boost_tree(trees = 1000, learn_rate = 0.05) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+```
+
+# 3. Test the models
+```{r}
+#create named list of models
+model_specs <- list(
+  linear = linear_model,
+  random_forest = rf_model,
+  xgboost = xgb_model
+)
+
+#create workflow set
+model_workflows <- workflow_set(
+  preproc = list(qmean = qmean_recipe),
+  models = model_specs
+)
+#fit the workflows 
+set.seed(123) 
+model_results <- model_workflows %>%
+  workflow_map(resamples = cv_folds, verbose = TRUE) 
+
+#vizualize
+autoplot(model_results)
+
+```
+
+# 4. Model Section
+
+#I selected the random forest model because it had the lowest RMSE and still showed a strong R² value, meaning it made accurate predictions with low error.
+
+#The model type is a random forest, using the ranger engine in regression mode. It likely performs well here because it handles nonlinear relationships and interactions between variables without overfitting.
+
+
+## Model Tuning
+
+#1 Build a model 
+```{r}
+rf_tune_model <- rand_forest(
+  mtry = tune(),      
+  min_n = tune(),      
+  trees = 500           
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+```
+
+
+#2 Create a Workflow
+```{r}
+rf_tune_workflow <- workflow() %>%
+  add_model(rf_tune_model) %>%
+  add_recipe(qmean_recipe)
+
+```
+
+#3 Check the Tunable Values
+```{r}
+#extract parameters
+dials <- extract_parameter_set_dials(rf_tune_workflow)
+
+#view the tuning parameters
+dials$object
+
+```
+
+#4. Define the Search Space
+```{r}
+#finalize the parameter
+dials_final <- finalize(dials, train_data)
+
+#create grid
+my.grid <- grid_space_filling(
+  dials_final,
+  size = 25
+)
+
+```
+
+#5 Tune the Model
+
+```{r}
+model_params <- tune_grid(
+  rf_tune_workflow,
+  resamples = cv_folds,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+autoplot(model_params)
+
+```
+#Answer:It looks like models with lower mtry values performed best — they had the lowest error and highest R². Performance dropped as mtry increased beyond ~10–15. min_n didn’t show a clear pattern, which suggests it wasn’t as influential for this dataset.
+
+#6. Check the skill of the tuned model 
+
+```{r}
+#collect metrics
+collect_metrics(model_params)
+
+show_best(model_params, metric = "mae")
+
+```
+
+
+#answer: The best-performing model based on MAE had mtry = 1 and min_n = 24. This combo gave the lowest average absolute error, meaning it predicted q_mean values most consistently across folds.
+
+```{r}
+hp_best <- select_best(model_params, metric = "mae")
+
+```
+
+#7. Finalizing the model
+```{r}
+#finalize and fit the model
+final_rf_workflow <- finalize_workflow(rf_tune_workflow, hp_best)
+
+final_rf_fit <- fit(final_rf_workflow, data = train_data)
+
+```
+
+## Final Model Verification
+
+```{r}
+#final fit
+final_fit <- last_fit(
+  final_rf_workflow,
+  split = data_split
+)
+
+#evaluate
+collect_metrics(final_fit)
+
+```
+
+#answer: The final model performed really well on the test set, with low RMSE and high R². This means the predictions were close to the actual values and the model explained nearly all the variance in q_mean. The performance is consistent with training, so the model generalized well.
+
+```{r}
+#ggplot
+ggplot(final_preds, aes(x = .pred, y = q_mean)) +
+  geom_point(aes(color = .pred), alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  scale_color_viridis_c(option = "C") +
+  labs(
+    title = "Predicted vs Actual q_mean (Test Set)",
+    x = "Predicted q_mean",
+    y = "Actual q_mean",
+    color = "Prediction"
+  ) +
+  theme_minimal()
+
+```
+
+## Building a Map
+```{r}
+#fit final model to cleaned data
+full_fit <- fit(final_rf_workflow, data = camels_clean)
+
+#predict
+library(broom)
+
+camels_aug <- augment(full_fit, new_data = camels_clean)
+
+#add residuals
+camels_aug <- camels_aug %>%
+  mutate(
+    residual = (.pred - q_mean)^2
+  )
+
+#create maps
+
+library(ggplot2)
+library(patchwork)
+
+#prediction map
+pred_map <- ggplot(camels_aug, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c(option = "C") +
+  labs(title = "Predicted q_mean", color = "Prediction") +
+  coord_fixed(1.3) +
+  theme_minimal()
+
+#residual map
+resid_map <- ggplot(camels_aug, aes(x = gauge_lon, y = gauge_lat, color = residual)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c(option = "C") +
+  labs(title = "Prediction Residuals (Squared Error)", color = "Residual") +
+  coord_fixed(1.3) +
+  theme_minimal()
+
+#combine
+pred_map + resid_map
+
+```
+
+
+
+
+
+
